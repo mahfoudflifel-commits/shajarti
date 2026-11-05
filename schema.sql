@@ -1,0 +1,53 @@
+-- Run in Supabase SQL Editor. Set up SMS provider in Authentication before OTP works.
+create extension if not exists pgcrypto;
+create table public.profiles(id uuid primary key references auth.users(id) on delete cascade,display_name text,created_at timestamptz default now());
+create table public.family_members(id uuid primary key default gen_random_uuid(),owner_id uuid not null references auth.users(id) on delete cascade,display_name text not null,relation text,created_at timestamptz default now(),unique(id,owner_id));
+create table public.staff(user_id uuid primary key references auth.users(id) on delete cascade,role text not null check(role in ('admin','field')));
+create table public.trees(id uuid primary key default gen_random_uuid(),code text unique not null,kind text not null check(kind in ('olive','palm')),status text not null default 'available' check(status in ('available','reserved','planted','lost')),owner_id uuid references auth.users(id),member_id uuid references public.family_members(id),location_label text,planted_at timestamptz,created_at timestamptz default now());
+create table public.tree_claims(id uuid primary key default gen_random_uuid(),tree_id uuid not null references public.trees(id),member_id uuid not null references public.family_members(id),requested_by uuid not null references auth.users(id),status text not null default 'pending' check(status in ('pending','approved','rejected')),created_at timestamptz default now());
+create unique index one_pending_claim_per_tree on public.tree_claims(tree_id) where status='pending';
+create table public.tree_updates(id uuid primary key default gen_random_uuid(),tree_id uuid not null references public.trees(id),activity_type text not null,notes text,photo_url text,created_by uuid references auth.users(id),created_at timestamptz default now());
+create function public.is_staff() returns boolean language sql stable security definer set search_path='' as $$select exists(select 1 from public.staff where user_id=(select auth.uid()))$$;
+create function public.is_admin() returns boolean language sql stable security definer set search_path='' as $$select exists(select 1 from public.staff where user_id=(select auth.uid()) and role='admin')$$;
+revoke all on function public.is_staff() from public; revoke all on function public.is_admin() from public;
+grant execute on function public.is_staff() to authenticated;grant execute on function public.is_admin() to authenticated;
+alter table public.profiles enable row level security;
+alter table public.family_members enable row level security;
+alter table public.staff enable row level security;
+alter table public.trees enable row level security;
+alter table public.tree_claims enable row level security;
+alter table public.tree_updates enable row level security;
+create policy profile_select on public.profiles for select to authenticated using(id=(select auth.uid()) or public.is_staff());
+create policy profile_insert on public.profiles for insert to authenticated with check(id=(select auth.uid()));
+create policy profile_update on public.profiles for update to authenticated using(id=(select auth.uid())) with check(id=(select auth.uid()));
+create policy family_select on public.family_members for select to authenticated using(owner_id=(select auth.uid()) or public.is_staff());
+create policy family_insert on public.family_members for insert to authenticated with check(owner_id=(select auth.uid()));
+create policy family_update on public.family_members for update to authenticated using(owner_id=(select auth.uid())) with check(owner_id=(select auth.uid()));
+create policy staff_self on public.staff for select to authenticated using(user_id=(select auth.uid()) or public.is_admin());
+create policy trees_select on public.trees for select to authenticated using(owner_id=(select auth.uid()) or public.is_staff());
+create policy trees_insert on public.trees for insert to authenticated with check(public.is_staff() and owner_id is null and member_id is null and status='available');
+create policy claims_select on public.tree_claims for select to authenticated using(requested_by=(select auth.uid()) or public.is_staff());
+create policy updates_select on public.tree_updates for select to authenticated using(public.is_staff() or exists(select 1 from public.trees t where t.id=tree_id and t.owner_id=(select auth.uid())));
+create policy updates_insert on public.tree_updates for insert to authenticated with check(public.is_staff() and created_by=(select auth.uid()));
+create function public.request_tree_claim(p_code text,p_member_id uuid) returns uuid language plpgsql security definer set search_path='' as $$declare v_tree public.trees%rowtype;v_id uuid;begin
+ if not exists(select 1 from public.family_members where id=p_member_id and owner_id=auth.uid()) then raise exception 'Family member not found';end if;
+ select * into v_tree from public.trees where code=upper(trim(p_code)) for update;
+ if not found or v_tree.status<>'available' then raise exception 'Tree is not available';end if;
+ insert into public.tree_claims(tree_id,member_id,requested_by) values(v_tree.id,p_member_id,auth.uid()) returning id into v_id;
+ return v_id;end$$;
+create function public.approve_tree_claim(p_claim_id uuid) returns void language plpgsql security definer set search_path='' as $$declare c public.tree_claims%rowtype;begin
+ if not public.is_staff() then raise exception 'Not authorized';end if;
+ select * into c from public.tree_claims where id=p_claim_id for update;
+ if not found or c.status<>'pending' then raise exception 'Invalid claim';end if;
+ update public.trees set owner_id=c.requested_by,member_id=c.member_id,status='planted',planted_at=now() where id=c.tree_id and status='available';
+ if not found then raise exception 'Tree already assigned';end if;
+ update public.tree_claims set status='approved' where id=c.id;
+ end$$;
+revoke all on function public.request_tree_claim(text,uuid) from public;
+revoke all on function public.approve_tree_claim(uuid) from public;
+grant execute on function public.request_tree_claim(text,uuid) to authenticated;
+grant execute on function public.approve_tree_claim(uuid) to authenticated;
+create function public.create_profile() returns trigger language plpgsql security definer set search_path='' as $$begin insert into public.profiles(id,display_name) values(new.id,coalesce(new.raw_user_meta_data->>'full_name','زائر'));return new;end$$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.create_profile();
+-- Grant first admin manually from SQL Editor after first login:
+-- insert into public.staff(user_id,role) values ('YOUR_AUTH_USER_UUID','admin');
